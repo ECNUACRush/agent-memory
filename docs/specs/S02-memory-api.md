@@ -5,8 +5,8 @@
 | 项 | 值 |
 |---|---|
 | 关联模块 | jiuwen_memory/api/ |
-| 最近一次修订日期 | 2026-09-30 |
-| 关联特性补充 | docs/features/api/F04-memory-metadata-separation.md，docs/features/api/F05-http-memory-api-alignment.md |
+| 最近一次修订日期 | 2026-10-10 |
+| 关联特性补充 | docs/features/api/F04-memory-metadata-separation.md，docs/features/api/F05-http-memory-api-alignment.md，docs/features/api/F06-upstream-rate-limit-errors.md |
 | 关联特性文档 | docs/features/api/F01-memory-api-impl-design.md，docs/features/api/F02-write-infer-extract.md，docs/features/api/F03-batch-write-api.md，docs/features/api/F04-memory-metadata-separation.md，docs/features/api/F05-http-memory-api-alignment.md，docs/features/F01-system-spec-design.md，docs/features/construction/F02-dynamic-extraction-consolidation.md，docs/features/construction/F04-cc-memory-compat.md，docs/features/construction/F05-construction-spec-multimodal-design.md，docs/features/construction/F08-entity-schema-extension.md，docs/features/common/F01-memory-layer.md，docs/features/common/F03-scope-space-isolation.md，docs/features/common/F05-security-api-contracts.md，docs/features/common/F08-memory-tree.md，docs/features/common/F09-log-privacy.md，docs/features/retrieval/F03-metadata-filtering.md，docs/features/control/F04-permission-context-routing.md，docs/features/control/F05-cloud-engine-design.md，docs/features/config/F01-config-source.md，docs/features/control/F07-collective-memory-design.md，docs/features/F04-dreaming.md，docs/features/ingest/F02-assets-ingestor-boundary.md |
 
 ## 文档分工
@@ -18,7 +18,7 @@
 | [architecture.md §6](../design/architecture.md) | **已实现**接口的清单（方法 / 语义 / 入参 / 出参） |
 | `jiuwen_memory/api/` | **已实现**接口的代码（`memory_api.py` 契约，`memory_api_impl/` 实现） |
 | 本文（S02） | 对外接口的详细介绍与用法：含已实现，以及已设计但尚未实现的增量；尚未实现处用 **状态：已设计、尚未实现** 标明。方法总览同时指向对应特性文档 |
-| `docs/features/api/`（F01–F05） | 特性决策（为什么这样改）；不重复罗列全部方法签名。各 F 覆盖哪些方法见下文方法总览与特性文档对照 |
+| `docs/features/api/`（F01–F06） | 特性决策（为什么这样改）；不重复罗列全部方法签名。各 F 覆盖哪些方法见下文方法总览与特性文档对照 |
 
 已设计但尚未实现的接口完成代码开发上库时：去掉本文（及受影响 F 文档）中的尚未实现标注，并把该方法（或增量入参）补进 architecture.md §6。
 ## Metadata 公共 API 契约
@@ -130,7 +130,7 @@ HTTP edge 将成功或失败响应统一写入 JSON；错误响应固定包含�
 | 未支持的 HTTP 方法 | 405 | `false` | `method not allowed` |
 | `ConflictError` | 409 | `false` | `resource conflict` |
 | `PartialFailureError` | 409 | `false` | 脱敏后的失败原因，并保留 `completed` / `failed` / `retry_action` |
-| `RateLimitedError` | 429 | `true` | `too many requests` |
+| `RateLimitedError` / OpenAI SDK `RateLimitError` | 429 | `true` | `too many requests` |
 | `BackendError` / `HealthCheckError` | 503 | `true` | `service temporarily unavailable` |
 | 请求体超过限制 | 413 | `false` | `request body is too large` |
 | 未预期异常 | 500 | `false` | `internal server error` |
