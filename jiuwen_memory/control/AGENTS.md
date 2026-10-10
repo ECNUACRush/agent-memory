@@ -53,7 +53,7 @@
    读取或 fallback。`MemoryPatch` 对两个命名空间分别 merge-update。
 
 1. **引擎不实现具体算法能力**：`MemoryEngine` 只编排，Ingestor/构建算子/Retriever/存储端口全部由装配注入。**记忆本体的写入一律经 `IndexBuilder`**——engine 不直接向真源写 KV。`InMemoryEngine` 保持 KVStore 读取路径；`CloudEngine` 的 MemoryUnit 读取（点读、列表、`scopes()` 枚举及 dreaming 候选解析）经注入的 `DomainStore` 完成。禁止绕过存储抽象绑定具体后端或在 engine 内调用 LLM。
-2. **引擎方法一律异步协程**：同步调用由 `api/` 层自行桥接（`asyncio.run`），engine 内不做同步阻塞。
+2. **引擎业务方法为异步协程**：同步业务调用由 `api/` 层自行桥接（`asyncio.run`），engine 内不做同步阻塞。`close` 是同步生命周期入口，由运行时调用以释放自有调度资源。
 3. **鉴权不在本层执行**：`PermissionManager.check` 由 `api/MemoryAPI` 在入口调用，engine 信任传入的 scope 已鉴权。Engine 提供 `permission_context_for_unit`、`list_with_permission_contexts` 和 `permission_contexts_for_delete`，供 API 使用真源 metadata 做类型化鉴权；list 的 items、count 与 contexts 必须来自同一次存储列表查询。禁止在 engine 内部重复 check。**判权范围的裁剪可落本层，判权的执行不可**：`collective/write_targets.py` 决定哪些候选空间被送去判权（截断规则），判权本身经 `can_write` 回调由 API 层执行；该裁剪的失效方向是未判即不进候选、表现为拒绝而非放行，因此可下沉。本层也不抛权限异常——缺兜底落点时返回空值，由 PEP 抛出。检索侧的逐空间判权循环不适用本条：其循环体就是 `PermissionManager.decide` 本身，移出等于移出 PEP；逐空间系统谓词的生成同样留 API 层，它按 `identity` 与空间事实取值。判权之后的部分可以下沉——`collective/cross_space_recall.py` 收已判权的空间目标与 `recall` 回调，做摊配、扇出与合并，不读 `identity`、不做裁决。
 4. **LifecycleManager 只做 Scope 内非破坏式标记**：`transition` / `supersede` 必须接收完整 Scope，只标记该 Scope 下的目标 id，绝不物理删除。物理删除（purge）走 engine 的 `delete` 路径 + `DeleteMode.PURGE`。
 5. **接口与实现严格分离**：顶层 `.py` 是纯抽象，不 import `*_impl/`。`*_impl/` 通过 producer 工厂被外部装配消费，不被顶层接口引用。
@@ -76,6 +76,12 @@
 18. **dreaming 控制层纯执行**（F04 D7，PEP 边界）：Engine / EvolveJob / FanOutResolver **不鉴权**——不接收 identity、不调 `PermissionManager.check`、不收 guard 闭包。三态分发、持续授权、fan-out 逐桶裁决与恢复编排在 API 层 `DreamingCoordinator`；Engine.evolve 只保留 candidate→resolver→一次性 EvolveJob。拒绝桶只以 `count:N` 脱敏摘要回显。定时注册要求 `scheduler.supports_recurring`。首次注册写序 submit→save，失败 cancel；更新复用 schedule_key 时 save 失败必须恢复旧 Job 声明。注销先持久化 `CANCEL_REQUESTED`，旧代 Driver 用 generation 自停；API 协调器不得在短状态锁内等待 Scheduler。周期实例空表启动也持 leader 租约，register 与每 tick 均复核；失锁以 `RecurringJobStoppedError` 停父 Timer。Scheduler 的 cancel/status 必须在其私有循环串行化，shutdown 必须 await 已取消任务后才能关循环。EvolveJob 的同步 Evolver 返回后须先合并结果再检查取消，使 CANCELLED 状态保留部分写入 ID。
 
 ## 双通道调度机制
+
+`AsyncTimerScheduler` 的 Timer/drain 只在其自有 `LoopRunner` 上运行；提交、取消与
+关闭的接纳通过生命周期锁排序。关闭后不接受新提交，取消排队项和周期注册，
+等待正在执行的 Job 收尾后释放 loop/线程。两个内置 Engine 的 `close` 都转发到
+各自注入的 Scheduler，覆盖具名共享与内联独立实例。无后台资源的 Scheduler/Engine
+可继承默认空 `close`；持有后台资源的扩展必须覆盖它。
 
 `Scheduler` 管理两条执行通道：
 

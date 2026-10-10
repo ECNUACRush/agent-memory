@@ -5,11 +5,26 @@
 | 项 | 值 |
 |---|---|
 | 关联模块 | jiuwen_memory/api/ |
-| 最近一次修订日期 | 2026-09-30 |
+| 最近一次修订日期 | 2026-10-10 |
 | 关联特性补充 | docs/features/api/F04-memory-metadata-separation.md，docs/features/api/F05-http-memory-api-alignment.md |
 | 关联特性文档 | docs/features/api/F01-memory-api-impl-design.md，docs/features/api/F02-write-infer-extract.md，docs/features/api/F03-batch-write-api.md，docs/features/api/F04-memory-metadata-separation.md，docs/features/api/F05-http-memory-api-alignment.md，docs/features/F01-system-spec-design.md，docs/features/construction/F02-dynamic-extraction-consolidation.md，docs/features/construction/F04-cc-memory-compat.md，docs/features/construction/F05-construction-spec-multimodal-design.md，docs/features/construction/F08-entity-schema-extension.md，docs/features/common/F01-memory-layer.md，docs/features/common/F03-scope-space-isolation.md，docs/features/common/F05-security-api-contracts.md，docs/features/common/F08-memory-tree.md，docs/features/common/F09-log-privacy.md，docs/features/retrieval/F03-metadata-filtering.md，docs/features/control/F04-permission-context-routing.md，docs/features/control/F05-cloud-engine-design.md，docs/features/config/F01-config-source.md，docs/features/control/F07-collective-memory-design.md，docs/features/F04-dreaming.md，docs/features/ingest/F02-assets-ingestor-boundary.md |
 
 ## 文档分工
+
+### 运行时生命周期
+
+`assemble_runtime(...) -> MemoryRuntime` 返回 `api` 与 `close(*, wait=True)`。
+关闭收尾在单个后台线程中执行，重复调用共享完成结果；`wait=False` 不等待，
+后续 `wait=True` 等待同一次关闭并重新抛出清理异常。仅在后台资源成功关闭后
+释放 dreaming leader 锁，防止旧任务与接管实例同时执行。
+`close` 先关闭摄入控制器，再关闭 Engine 的后台资源与根 Scheduler；即使某一步
+失败也尝试后续清理。默认等待在飞后台任务和自有线程结束。`wait=False` 允许在飞
+任务继续收尾，不能在返回后立即假定所有 I/O 已停止。关闭后台 Scheduler 后不再
+接纳新调度任务；调用方须先停止业务入口。运行时关闭不自动释放外部注入的存储连接。
+只返回 API 的 `assemble` 保持兼容；需要确定性收尾的嵌入式调用方使用 runtime。
+设计与限制见 [F09](../features/control/F09-runtime-scheduler-shutdown.md)。
+
+### 文档职责
 
 对外接口相关内容分四处维护，互不替代。
 
