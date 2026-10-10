@@ -23,7 +23,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from concurrent.futures import Future
+from dataclasses import dataclass, field
+from threading import Lock, Thread
 from typing import Any, Protocol, runtime_checkable
 
 from jiuwen_memory.common._support import as_bool
@@ -46,7 +48,7 @@ from jiuwen_memory.config.defaults import KV_DEFAULT_NAME, ROOT_PARAMS, default_
 from jiuwen_memory.construction.bootstrap import register_constructors
 from jiuwen_memory.construction.router import optional_router
 from jiuwen_memory.control.bootstrap import register_controllers
-from jiuwen_memory.control.engine import EngineProducer
+from jiuwen_memory.control.engine import EngineProducer, MemoryEngine
 from jiuwen_memory.control.governance import GovernorProducer
 from jiuwen_memory.control.ingest_job import IngestJobController, IngestJobProducer
 from jiuwen_memory.control.membership import MembershipProducer
@@ -98,6 +100,9 @@ class _Kernel:
             F04 §5.4 默认 raw，opt-in encrypted target 才包装）
         storage: 上层统一使用的 StoreManager（默认 CompositeStoreManager；数据面
             领域操作经 ``storage.domain_store()``；配置段名 ``store_manager:``）
+        ingest_jobs: 摄入任务控制器，由 runtime 关闭
+        engine: 业务引擎，负责关闭其后台调度资源
+        scheduler: API 管理面使用的根调度器，不一定与 engine 内实例相同
         space: SpaceManager（若装配）
         config_source: 运行时晚绑定配置来源（默认 YamlDefaultsConfigSource）
     """
@@ -106,9 +111,10 @@ class _Kernel:
     kv: KVStore
     storage: StoreManager
     ingest_jobs: IngestJobController
+    engine: MemoryEngine
+    scheduler: Scheduler
     space: SpaceManager | None = None
     config_source: ConfigSource | None = None
-    scheduler: Scheduler | None = None
 
 
 @runtime_checkable
@@ -120,6 +126,7 @@ class MemoryRuntime(Protocol):
         ...
 
     def close(self, *, wait: bool = True) -> None:
+        """关闭摄入与引擎/根调度器；wait=True 等待后台任务和线程退出。"""
         ...
 
 
@@ -127,20 +134,40 @@ class MemoryRuntime(Protocol):
 class _MemoryRuntime:
     api: MemoryAPI
     _ingest_jobs: IngestJobController
-    _scheduler: Scheduler | None = None
+    _engine: MemoryEngine
+    _scheduler: Scheduler
+
+    _close_lock: Lock = field(default_factory=Lock, init=False, repr=False)
+    _completion: Future[None] | None = field(default=None, init=False, repr=False)
 
     def close(self, *, wait: bool = True) -> None:
-        self._ingest_jobs.close(wait=wait)
-        # 先停调度器，再释放 dreaming leader 锁。反序会允许新实例接管后，
-        # 本实例尚未停下的 Timer / drain 继续执行，形成短暂双跑。
-        if self._scheduler is not None:
-            self._scheduler.shutdown()
-        # dreaming 实例锁（F04 D8 关闭语义）：owner 匹配释放（未持锁幂等，
-        # 不误删他人锁）。锁不属于 MemoryAPI 公共契约（Protocol 上没有），
-        # 经 getattr 探测——只有装配了演进能力的实现才有。
-        release_lock = getattr(self.api, "release_dreaming_lock", None)
-        if callable(release_lock):
-            release_lock()
+        with self._close_lock:
+            if self._completion is None:
+                self._completion = Future()
+                Thread(
+                    target=self._finish_close, name="agent-memory-runtime-close", daemon=True
+                ).start()
+            completion = self._completion
+        if wait:
+            completion.result()
+
+    def _finish_close(self) -> None:
+        try:
+            try:
+                self._ingest_jobs.close(wait=True)
+            finally:
+                try:
+                    self._engine.close(wait=True)
+                finally:
+                    self._scheduler.close(wait=True)
+            # 调度任务完全停止后才释放 leader 锁，避免接管实例与旧任务双跑。
+            release_lock = getattr(self.api, "release_dreaming_lock", None)
+            if callable(release_lock):
+                release_lock()
+        except BaseException as exc:
+            self._completion.set_exception(exc)
+        else:
+            self._completion.set_result(None)
 
 
 def _coerce_config(config: Config | Mapping[str, Any] | None) -> Config | None:
@@ -268,14 +295,15 @@ def _build_kernel(
             f"{type(ingest_jobs).__name__}"
         )
     space = SpaceProducer.dep(root, default="kv")
-    scheduler = SchedulerProducer.dep(root, default="in_process")
     lock_specs = root.ctx.namespaces.get(LockProducer.TOP_NAME, {})
     dreaming_lock = (
         LockProducer.build_named("dreaming", root.ctx) if "dreaming" in lock_specs else None
     )
 
+    engine = EngineProducer.dep(root, default="in_memory")
+    scheduler = SchedulerProducer.dep(root, default="in_process")
     api = LocalMemoryAPI(
-        engine=EngineProducer.dep(root, default="in_memory"),
+        engine=engine,
         permission=PermissionProducer.dep(root, default="sqlite"),
         scheduler=scheduler,
         dreaming_lock=dreaming_lock,
@@ -312,6 +340,7 @@ def _build_kernel(
         ingest_jobs=ingest_jobs,
         space=space,
         config_source=config_source,
+        engine=engine,
         scheduler=scheduler,
     )
 
@@ -355,5 +384,6 @@ def assemble_runtime(
     return _MemoryRuntime(
         api=kernel.api,
         _ingest_jobs=kernel.ingest_jobs,
+        _engine=kernel.engine,
         _scheduler=kernel.scheduler,
     )

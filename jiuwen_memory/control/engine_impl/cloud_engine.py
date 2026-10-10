@@ -268,6 +268,10 @@ class CloudEngine(MemoryEngine):
     def health(self) -> None:
         return None
 
+    def close(self, *, wait: bool = True) -> None:
+        if self._scheduler is not None:
+            self._scheduler.close(wait=wait)
+
     async def write(
         self,
         content: str,

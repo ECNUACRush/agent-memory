@@ -28,10 +28,12 @@ import copy
 import time
 import uuid
 from collections import defaultdict, deque
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from threading import Lock
 
-from jiuwen_memory.common.errors import NotFoundError, PermissionDeniedError
+from jiuwen_memory.common.errors import BackendError, NotFoundError, PermissionDeniedError
 from jiuwen_memory.common.log import (
     get_logger,
     metadata_for_log,
@@ -95,8 +97,11 @@ class AsyncTimerScheduler(Scheduler):
     def __init__(self, tick_interval: int = 10) -> None:
         self._tick_interval = tick_interval
 
-        # 常驻守护 loop——Timer/drain Task 的宿主，随进程存活（daemon 线程）。
+        # 常驻守护 loop——Timer/drain Task 的宿主，由 close 释放。
         self._runner = LoopRunner(thread_name="agent-memory-scheduler-loop")
+        self._lifecycle_lock = Lock()
+        self._closed = False
+        self._shutdown: Future[None] | None = None
 
         # per scope 三件套：queue（FIFO 队列）+ drain_task（单消费协程）
         # 同 scope 串行性由"per scope 单 drain Task"保证——单线程事件循环 + 单
@@ -140,6 +145,8 @@ class AsyncTimerScheduler(Scheduler):
         与 :meth:`submit` 共用同一校验——Engine 落盘前先调本方法 fail fast，
         避免「submit 拒绝但原文已落盘」的残留窗口。
         """
+        if self._closed:
+            raise BackendError("scheduler is closed")
         if job.interval > 0 and job.interval < self._tick_interval:
             raise ValueError(
                 f"interval {job.interval} < tick_interval {self._tick_interval}: "
@@ -157,20 +164,33 @@ class AsyncTimerScheduler(Scheduler):
         # 跨 loop 提交到守护 loop：_submit_on_loop 内部的 create_task 落在守护
         # loop 上，Timer/drain 生命周期与调用方 loop（可能是 asyncio.run 的
         # 临时 loop）解耦。async 调用方经 wrap_future 在自己的 loop 上等待。
-        future = asyncio.run_coroutine_threadsafe(
-            self._submit_on_loop(job, channel), loop
-        )
+        with self._lifecycle_lock:
+            if self._closed:
+                raise BackendError("scheduler is closed")
+            future = self._runner.submit(self._submit_on_loop(job, channel))
         return await asyncio.wrap_future(future)
 
     async def _submit_on_loop(self, job: Job, channel: Channel) -> str:
         """守护 loop 上执行的实际提交逻辑（原 submit 主体）。"""
+        if self._closed:
+            raise BackendError("scheduler is closed")
         scope_key = self._scope_key(job.scope)
         if job.interval > 0:
             return self._submit_timer(scope_key, job, channel)
         return self._submit_once(scope_key, job, channel)
 
     def status(self, job_id: str) -> JobInfo:
-        return self._runner.run(self._status_snapshot(job_id), timeout=10)
+        with self._lifecycle_lock:
+            if not self._closed:
+                future = self._runner.submit(self._status_snapshot(job_id))
+            else:
+                future = None
+                completion = self._shutdown
+        if future is not None:
+            return future.result(timeout=10)
+        if completion is not None:
+            completion.result()
+        return self._status_snapshot_now(job_id)
 
     async def _status_snapshot(self, job_id: str) -> JobInfo:
         return self._status_snapshot_now(job_id)
@@ -199,7 +219,13 @@ class AsyncTimerScheduler(Scheduler):
             调用方主线程 / 临时请求 loop 等）。在守护 loop 协程内取消请直接
             ``await self._cancel_on_loop(job_id)``。
         """
-        self._runner.run(self._cancel_on_loop(job_id), timeout=10)
+        if self._runner.in_loop_thread():
+            raise RuntimeError("cancel must be called outside the scheduler loop")
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            future = self._runner.submit(self._cancel_on_loop(job_id))
+        future.result()
 
     def link_child(self, child_job_id: str, parent_job_id: str) -> None:
         # DriverJob 在守护 loop 内调用；同 loop 路径必须同步完成关联，保证子任务
@@ -233,6 +259,49 @@ class AsyncTimerScheduler(Scheduler):
                 child_job.inherit_cancellation_from(parent_job)
             elif parent.status != JobStatus.RUNNING:
                 child_job.request_cancel()
+
+    def close(self, *, wait: bool = True) -> None:
+        """停止新任务，取消排队任务，让在飞任务收尾后关闭自有 loop。
+
+        wait=False 立即返回；之后可再次 close(wait=True) 等待线程完全退出。
+        wait=True 只能从调度器线程之外调用。
+        """
+        if wait and self._runner.in_loop_thread():
+            raise RuntimeError("cannot wait for shutdown on the scheduler loop")
+        with self._lifecycle_lock:
+            if not self._closed:
+                self._closed = True
+                self._shutdown = self._runner.submit(self._close_on_loop())
+                self._shutdown.add_done_callback(lambda _: self._runner.close(wait=False))
+            future = self._shutdown
+        if wait:
+            try:
+                if future is not None:
+                    future.result()
+            finally:
+                self._runner.close()
+
+    async def _close_on_loop(self) -> None:
+        drains = set(self._scope_drain_tasks.values())
+        timers = [task for task in self._background_tasks if task not in drains and not task.done()]
+        for task in timers:
+            task.cancel()
+        for wheel in self._wheels.values():
+            for entry in wheel.entries:
+                info = self._jobs[entry.job_id]
+                info.status = JobStatus.SUCCEEDED if entry.is_done else JobStatus.CANCELLED
+                info.detail["finished_at"] = self._now_iso()
+        self._wheels.clear()
+        for queue in self._scope_queues.values():
+            while queue:
+                job_id, _ = queue.popleft()
+                self._jobs[job_id].status = JobStatus.CANCELLED
+                self._jobs[job_id].detail["finished_at"] = self._now_iso()
+        await asyncio.gather(*timers, *self._scope_drain_tasks.values(), return_exceptions=True)
+        self._scope_queues.clear()
+        self._scope_drain_tasks.clear()
+        self._live_jobs.clear()
+        self._background_tasks.clear()
 
     async def _cancel_on_loop(self, job_id: str) -> None:
         self._cancel_now(job_id)
@@ -271,6 +340,9 @@ class AsyncTimerScheduler(Scheduler):
         注册表在 KV 里的持久化不受影响——重启后 ``restore_dreaming`` 重新装配。
         LoopRunner 的 daemon 线程由进程管理，本方法只清理由 Scheduler 创建的任务。幂等。
         """
+        if self._closed:
+            self.close()
+            return
         try:
             self._runner.run(self._cancel_all_tasks(), timeout=10)
         except concurrent.futures.TimeoutError:
@@ -331,7 +403,7 @@ class AsyncTimerScheduler(Scheduler):
         但不会触发第二个 drain——FIFO 顺序消费。
         """
         queue = self._scope_queues[scope_key]
-        while queue:
+        while queue and not self._closed:
             job_id, job = queue.popleft()
             info = self._jobs[job_id]
             if info.status == JobStatus.CANCELLED:
@@ -568,6 +640,8 @@ class AsyncTimerScheduler(Scheduler):
         """
         while True:
             await asyncio.sleep(self._tick_interval)
+            if self._closed:
+                return
             now = int(time.monotonic())
 
             # snapshot——遍历中 submit 路径若 append 不影响本帧

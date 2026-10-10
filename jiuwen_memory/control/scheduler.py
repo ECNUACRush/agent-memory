@@ -42,6 +42,13 @@ class SchedulerProducer(Factory):
 
 
 class Scheduler(ControlOperator):
+    def close(self, *, wait: bool = True) -> None:
+        """释放自有后台资源；默认无后台资源，实现可覆盖且须幂等。
+
+        关闭后台调度器时停止定时触发并取消排队任务；wait=True 等待已执行的任务
+        和自有线程退出，wait=False 允许在飞任务收尾。关闭后拒绝新的后台提交。
+        """
+
     def validate(self, job: Job) -> None:
         """提交前校验 job 的可调度性，不可调度时抛错——默认无约束。
 

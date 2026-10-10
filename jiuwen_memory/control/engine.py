@@ -2,7 +2,7 @@
 """MemoryEngine — 记忆引擎（接口层 §9 各语义的编排中枢）。
 
 记忆接口层 ``jiuwen_memory/api`` 是本引擎的薄封装：只做参数装配后逐方法委托到
-这里，跨层编排全部在引擎内完成。**引擎方法一律为异步协程**（数据面与
+这里，跨层编排全部在引擎内完成。**引擎业务方法为异步协程**（数据面与
 管理面均触及 IO——存储、向量库、LLM/embedding），事件循环形态（HTTP/
 MCP）可直接 await 非阻塞调用，CLI/脚本等同步形态由接口层 ``jiuwen_memory/api``
 自行桥接（如 ``asyncio.run``）：
@@ -15,6 +15,7 @@ MCP）可直接 await 非阻塞调用，CLI/脚本等同步形态由接口层 ``
 - evolve：委托 Scheduler 双通道调度；admin_*：委托 PolicyManager。
 
 Ingestor / 构建层算子 / Retriever / 其余控制算子 / Store 由装配注入。
+``close`` 是同步生命周期入口，用于等待自有后台调度资源退出。
 """
 
 from __future__ import annotations
@@ -74,6 +75,9 @@ class MemoryEngine(ControlOperator):
     def candidate_scopes(self) -> list[Scope]:
         """返回演进候选数据面中已有记忆的作用域。"""
         return self.kv.scopes()
+
+    def close(self, *, wait: bool = True) -> None:
+        """释放本引擎的后台调度资源；同步生命周期入口，默认无操作且须幂等。"""
 
     @abstractmethod
     async def write(
